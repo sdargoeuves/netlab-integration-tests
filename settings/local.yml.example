@@ -1,0 +1,14 @@
+# Copy to settings/local.yml and adapt to your host. local.yml is included automatically in every
+# run (--no-default-settings to skip it) and is not meant to be shared.
+
+# netlab to run the tests with. Without this line, the netlab on your PATH is used.
+# Point it to a netlab git clone (https://github.com/ipspace/netlab) to test any branch: dev,
+# or a branch you're working on. A git clone is needed for --all, because the integration
+# test suite is not installed with netlab.
+# netlab: ~/src/netlab
+
+set:
+  # Replace netlab default images you don't have locally (docker images | grep <name>).
+  # Some tests use these devices as helper nodes, whatever the device under test.
+  # defaults.devices.eos.clab.image: ceos:4.34.5M
+  # defaults.devices.iol.clab.image: vrnetlab/cisco_iol:17.18.02

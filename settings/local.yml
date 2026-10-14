@@ -1,0 +1,14 @@
+# Settings for this host only, included automatically in every run (--no-default-settings to skip).
+# Not meant to be shared: see local.yml.example for a template.
+
+# netlab to run the tests with: a netlab git clone on any branch (dev, or a branch you're
+# working on; needed for --all), or a netlab executable
+netlab: ~/code/quick-netlab-lab/netlab
+
+set:
+  defaults.lab_status_lock_timeout: 10 # the default value of 3s is too aggressive when many lab instances start/stop simultaneously
+  # Local container images replacing netlab defaults that aren't available on this host
+  # netlab default is ceos:4.34.2F (netsim/devices/eos.yml); closest local release train
+  defaults.devices.eos.clab.image: ceos:4.34.5M
+  # netlab default is vrnetlab/cisco_iol:17.16.01a; IOL helper nodes in dhcp/04,12,21 and eigrp/01,02
+  defaults.devices.iol.clab.image: vrnetlab/cisco_iol:17.18.02

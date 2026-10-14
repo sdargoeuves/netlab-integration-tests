@@ -1,0 +1,19 @@
+# Settings for ASAv integration tests: ./parallel-test --settings settings/asav.yml ...
+#
+# plugin: added to every test with --plugin
+# set:    dotted topology keys, passed to netlab create as -s key=value
+#         * scalars only, no '=' in keys or values
+#         * the node name in nodes.X... may be a wildcard: nodes.dut*... applies to every
+#           matching node (dut, dut_a, dut2, ...); tests without a matching node skip the setting
+plugin: [ files ]
+set:
+  defaults.device: asav
+  # defaults.devices.asav.clab.image: vrnetlab/cisco_asav:9-18-1
+  defaults.devices.asav.clab.image: vrnetlab/cisco_asav:9-20-2-2
+  # Longer SSH ready check (retries x delay seconds), useful with several ASAv booting in parallel
+  defaults.devices.asav.clab.group_vars.netlab_check_retries: 60
+  defaults.devices.asav.clab.group_vars.netlab_check_delay: 10
+  nodes.dut.loopback: true
+  # ASAv drops traffic between interfaces with the same security level by default
+  nodes.dut*.config.inline: |
+    same-security-traffic permit inter-interface

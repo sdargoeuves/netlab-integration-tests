@@ -1,0 +1,984 @@
+#!/usr/bin/env python3
+#
+# Run netlab integration tests in parallel, one multilab instance per running test
+#
+# Mirrors the create/up/initial/validate/down sequence of
+# netlab/tests/integration/device-module-test, but every test gets:
+#
+# * its own lab directory (generated netlab files, disposable, under --workdir)
+# * its own log directory (step logs, kept, under --logdir/<run>)
+# * a multilab instance ID taken from a pool, returned to the pool after cleanup
+#
+# Every run also appends one line per test to --logdir/history.tsv
+#
+
+import argparse
+import datetime
+import fnmatch
+import glob
+import json
+import os
+import queue
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import termios
+import threading
+import time
+import typing
+from concurrent.futures import ThreadPoolExecutor
+
+import yaml
+
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+DEFAULT_LOGDIR = os.path.join(SCRIPT_DIR, 'logs')
+DEFAULT_WORKDIR = '/tmp/test-netlab'
+STATUS_FILE = os.path.expanduser('~/.netlab/status.yaml')
+RESERVED_IDS = {121}                # 192.168.121.0/24 is the default netlab management subnet
+DEFAULT_LOCK = '~/.netlab/lab.lock'
+LAB_STATUS_FILE = 'netlab-status.yaml'           # Per-lab netlab status file, in the lab directory
+DEFAULT_SETTINGS = [os.path.join(SCRIPT_DIR, 'settings', 'local.yml')]    # Per-host settings, used when present
+HISTORY_FIELDS = ['date', 'run', 'device', 'provider', 'image', 'netlab', 'test', 'status', 'failed_step', 'duration', 'logs', 'reason', 'settings']
+STATUSES = ('ok', 'warning', 'unsupported', 'fail', 'aborted')
+HISTORY_ORDER = ('fail', 'aborted', 'warning', 'ok', 'unsupported')   # Order of a run's rows in history.tsv
+UNSUPPORTED_ERRORS = ('IncorrectValue', 'IncorrectAttr', 'IncorrectType')  # netlab's "device can't do that" categories
+ERROR_LINE = re.compile(r'^([A-Z][A-Za-z]+) in [\w.]+: ')
+
+print_lock = threading.Lock()
+run_log: typing.Optional[typing.TextIO] = None
+active_dirs: typing.Dict[str, typing.Tuple[int, str]] = {}  # labdir -> (instance ID, logdir) of labs that might be running
+active_lock = threading.Lock()
+running_procs: typing.Dict[subprocess.Popen, bool] = {}     # running step -> may be interrupted (cleanup may not)
+procs_lock = threading.Lock()
+unsupported_lock = threading.Lock()                         # Serializes appends to the run's unsupported.log
+stop_event = threading.Event()
+
+
+def log(msg: str) -> None:
+  line = f"{time.strftime('%H:%M:%S')} {msg}"
+  with print_lock:
+    try:
+      print(line, flush=True)
+    except OSError:                               # Terminal gone (SIGHUP), keep going: run.log still gets it
+      pass
+    if run_log:
+      run_log.write(line + '\n')
+      run_log.flush()
+
+
+def failed() -> str:
+  """Word for a failed step: once the run is interrupted, failures are (almost certainly) our doing"""
+  return 'interrupted' if stop_event.is_set() else 'FAILED'
+
+
+def parse_args() -> argparse.Namespace:
+  p = argparse.ArgumentParser(description='Run netlab integration tests in parallel using the multilab plugin')
+  p.add_argument('tests', nargs='*', help='Test files or directories (directories are globbed with --limit)')
+  p.add_argument('-d', '--device', help='Device type to test (default: defaults.device from --settings files)')
+  p.add_argument('--cleanup', action='store_true',
+                 help='Tear down every lab left under --workdir (e.g. after the script was killed), then exit')
+  p.add_argument('-p', '--provider', default='clab', help='Virtualization provider (default: clab)')
+  p.add_argument('-i', '--image', help='Device image (sets defaults.devices.<device>.<provider>.image)')
+  p.add_argument('-s', '--set', dest='settings', action='append', default=[],
+                 help='Extra netlab create --set parameter (can be repeated, applied after --settings files)')
+  p.add_argument('--settings', dest='settings_files', action='append', default=[],
+                 help='YAML file with extra plugins and --set values for every test (can be repeated)')
+  p.add_argument('--no-default-settings', action='store_true',
+                 help='Do not include settings/local.yml automatically')
+  p.add_argument('-j', '--jobs', type=int, default=3, help='Number of labs running at the same time (default: 3)')
+  p.add_argument('--ids', help='Comma-separated multilab IDs to use (default: --first-id onwards)')
+  p.add_argument('--first-id', type=int, default=11, help='First multilab ID when --ids is not used (default: 11)')
+  p.add_argument('-l', '--limit', default='[0-9]', help='Test file prefix pattern for directories (default: [0-9])')
+  p.add_argument('--all', action='store_true', help='Run every test directory of the netlab integration test suite')
+  p.add_argument('--from-run', help="Run the tests of a previous run (run name, 'latest' or run folder), see --only")
+  p.add_argument('--only', default='ok,warning,fail,aborted',
+                 help='With --from-run: statuses to select (default: ok,warning,fail,aborted = all but unsupported)')
+  p.add_argument('--steps', default='create,up,initial,validate', help='Steps to execute')
+  p.add_argument('--name', help='Run name, used as directory name (default: <device>-<timestamp>)')
+  p.add_argument('--logdir', default=DEFAULT_LOGDIR, help=f'Root log directory, kept (default: {DEFAULT_LOGDIR})')
+  p.add_argument('-w', '--workdir', default=DEFAULT_WORKDIR,
+                 help=f'Root directory for generated lab files, removed after cleanup (default: {DEFAULT_WORKDIR})')
+  p.add_argument('--netlab', '--netlab-dir', dest='netlab',
+                 help="netlab to use: a netlab git clone directory (any branch) or a netlab executable "
+                      "(default: 'netlab:' from the settings files, else netlab on PATH)")
+  p.add_argument('--lock', default=DEFAULT_LOCK,
+                 help=f'multilab lock file serializing containerlab deploy/destroy (default: {DEFAULT_LOCK})')
+  p.add_argument('--no-lock', action='store_true', help='Let containerlab deploy/destroy run concurrently')
+  p.add_argument('--shared-status-file', action='store_true',
+                 help='Register labs in the shared netlab status file (visible in netlab status) instead of '
+                      'one status file per lab')
+  p.add_argument('--keep-failed', action='store_true',
+                 help='Leave failed labs running for troubleshooting (their ID is not reused)')
+  p.add_argument('--sudo', action='store_true',
+                 help='Prime and keep sudo credentials alive (only needed for tests using tc or clab linux bridges)')
+  p.add_argument('-v', '--verbose', action='store_true', help='Do not limit validation output to errors')
+  return p.parse_args()
+
+
+def collect_tests(paths: typing.List[str], limit: str) -> typing.List[str]:
+  tests: typing.List[str] = []
+  for path in paths:
+    if os.path.isdir(path):
+      found = sorted(glob.glob(os.path.join(path, f'{limit}*.yml')))
+      if not found:
+        print(f'Warning: no tests matching {limit}*.yml in {path}', file=sys.stderr)
+      tests.extend(found)
+    elif os.path.isfile(path):
+      tests.append(path)
+    else:
+      sys.exit(f'Cannot find test {path}')
+  return [os.path.abspath(t) for t in tests]
+
+
+def all_test_dirs(args: argparse.Namespace) -> typing.List[str]:
+  """Every directory of the netlab integration test suite that contains tests matching --limit"""
+  if not args.netlab_checkout:
+    sys.exit(f"--all needs a netlab git clone (the test suite isn't installed with netlab): "
+             f"set 'netlab: <git clone directory>' in settings/local.yml or use --netlab")
+  root = os.path.join(args.netlab_checkout, 'tests', 'integration')
+  dirs = set()
+  for dirpath, dirnames, _ in os.walk(root):
+    dirnames[:] = [d for d in dirnames if d != '__pycache__']
+    if glob.glob(os.path.join(dirpath, f'{args.limit}*.yml')):
+      dirs.add(dirpath)
+  if not dirs:
+    sys.exit(f'No integration tests found under {root}')
+  return sorted(dirs)
+
+
+def resolve_run_dir(args: argparse.Namespace, run: str) -> str:
+  """A run given as a name in --logdir, 'latest', or a path to a run folder"""
+  for candidate in (run, os.path.join(args.logdir, run)):
+    if os.path.isfile(os.path.join(candidate, 'results.yaml')):
+      return os.path.realpath(candidate)
+  sys.exit(f"Cannot find run {run}: expected a run name in {args.logdir}, 'latest', or a run folder with results.yaml")
+
+
+def tests_from_run(args: argparse.Namespace) -> typing.List[str]:
+  """Tests of a previous run, filtered by status (--only)"""
+  run_dir = resolve_run_dir(args, args.from_run)
+  with open(os.path.join(run_dir, 'results.yaml')) as f:
+    results = yaml.safe_load(f) or []
+  run_tests = []                                  # Full paths, for runs from before 'path' was recorded
+  if os.path.exists(os.path.join(run_dir, 'run-info.yaml')):
+    with open(os.path.join(run_dir, 'run-info.yaml')) as f:
+      info = yaml.safe_load(f) or {}
+    run_tests = info.get('tests', []) or []
+    if args.device and info.get('device') and info['device'] != args.device:
+      print(f"Warning: run {os.path.basename(run_dir)} tested {info['device']}, this run tests {args.device}",
+            file=sys.stderr)
+  only = {s.strip() for s in args.only.split(',')}
+  unknown = only - set(STATUSES)
+  if unknown:
+    sys.exit(f"--only: unknown status {', '.join(sorted(unknown))} (valid: {', '.join(STATUSES)})")
+  tests = []
+  for r in results:
+    if r.get('status') not in only:
+      continue
+    path = r.get('path') or next((t for t in run_tests if t.endswith('/' + r['test'])), None)
+    if not path or not os.path.isfile(path):
+      print(f"Warning: cannot find test {r['test']} from run {os.path.basename(run_dir)}, skipped", file=sys.stderr)
+      continue
+    tests.append(path)
+  print(f"{len(tests)} test(s) from run {os.path.basename(run_dir)} with status {', '.join(sorted(only))}")
+  return tests
+
+
+def running_ml_labs() -> typing.Dict[int, str]:
+  """
+  multilab labs that really run: lab ID -> lab directory, from the containers containerlab created
+  (name clab-ml-<id>-<node>, label clab-topo-file). Docker is the reliable source: our labs use
+  per-lab status files, and the shared netlab status file can lose entries
+  """
+  try:
+    out = subprocess.run(['docker', 'ps', '--filter', 'name=clab-ml-',
+                          '--format', '{{.Names}}\t{{.Label "clab-topo-file"}}'],
+                         capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=60).stdout
+  except Exception:
+    return {}
+  labs: typing.Dict[int, str] = {}
+  for line in out.splitlines():
+    name, _, topo = line.partition('\t')
+    m = re.match(r'clab-ml-(\d+)-', name)
+    if m:
+      labs.setdefault(int(m.group(1)), os.path.dirname(topo) if topo else '')
+  return labs
+
+
+def ids_in_use() -> typing.Set[int]:
+  """multilab IDs in use: registered in the shared netlab status file, or with running containers"""
+  ids = set(running_ml_labs())
+  try:
+    with open(STATUS_FILE) as f:
+      status = yaml.safe_load(f) or {}
+    ids |= {int(k) for k in status if str(k).isdigit()}
+  except Exception:                               # Missing, or caught while netlab rewrites it
+    pass
+  return ids
+
+
+def build_id_pool(args: argparse.Namespace, size: int) -> 'queue.Queue[int]':
+  """Pool of 'size' multilab IDs: one per lab that can run at the same time"""
+  busy = ids_in_use() | RESERVED_IDS
+  if args.ids:
+    wanted = [int(x) for x in args.ids.split(',')][:size]
+    clash = [i for i in wanted if i in busy]
+    if clash:
+      sys.exit(f'multilab ID(s) {clash} already in use or reserved (see {STATUS_FILE})')
+  else:
+    wanted, candidate = [], args.first_id
+    while len(wanted) < size and candidate <= 200:
+      if candidate not in busy:
+        wanted.append(candidate)
+      candidate += 1
+  if not wanted or any(i < 1 or i > 200 for i in wanted):
+    sys.exit('multilab IDs must be between 1 and 200')
+  pool: 'queue.Queue[int]' = queue.Queue()
+  for i in wanted:
+    pool.put(i)
+  return pool
+
+
+def resolve_netlab(args: argparse.Namespace) -> None:
+  """
+  Find the netlab to use: --netlab, else the last 'netlab:' in the settings files, else netlab on PATH.
+  Sets args.netlab_exe, args.netlab_checkout (None for an installed netlab) and args.netlab_source
+  """
+  if args.netlab:
+    path, source = os.path.expanduser(args.netlab), '--netlab'
+  elif args.settings_netlab:
+    path, source = args.settings_netlab
+  else:
+    path, source = shutil.which('netlab') or '', 'PATH'
+    if not path:
+      sys.exit("No netlab found: install netlab, set 'netlab: <git clone directory or executable>' in "
+               "settings/local.yml, or use --netlab")
+  exe = os.path.join(path, 'netlab') if os.path.isdir(path) else path
+  if not (os.path.isfile(exe) and os.access(exe, os.X_OK)):
+    sys.exit(f'netlab from {source}: {exe} is not an executable netlab')
+  exe = os.path.abspath(exe)
+  top = os.path.dirname(exe)                      # A checkout has the netlab script next to the netsim package
+  args.netlab_exe = exe
+  args.netlab_checkout = top if os.path.isdir(os.path.join(top, 'netsim')) else None
+  args.netlab_source = source
+
+
+def add_netlab_to_path(args: argparse.Namespace) -> str:
+  """
+  Put a 'netlab' wrapper for the chosen netlab first on PATH for every step, so commands that call
+  plain 'netlab' (test-defined step scripts such as initial/10-reload) use the same netlab as the run
+  """
+  shim_dir = os.path.join(args.run_workdir, '.bin')
+  os.makedirs(shim_dir, exist_ok=True)
+  shim = os.path.join(shim_dir, 'netlab')
+  with open(shim, 'w') as f:
+    f.write(f'#!/bin/sh\nexec {shlex.quote(args.netlab_exe)} "$@"\n')
+  os.chmod(shim, 0o755)
+  os.environ['PATH'] = shim_dir + os.pathsep + os.environ.get('PATH', '')   # Steps inherit os.environ
+  return shim_dir
+
+
+def netlab_cmd(args: argparse.Namespace) -> typing.List[str]:
+  return [args.netlab_exe]
+
+
+def netlab_version(args: argparse.Namespace) -> str:
+  """branch@commit for a git checkout, else the release reported by 'netlab version'"""
+  if args.netlab_checkout:
+    try:
+      branch = subprocess.run(['git', '-C', args.netlab_checkout, 'rev-parse', '--abbrev-ref', 'HEAD'],
+                              capture_output=True, text=True, check=True).stdout.strip()
+      commit = subprocess.run(['git', '-C', args.netlab_checkout, 'describe', '--always', '--dirty'],
+                              capture_output=True, text=True, check=True).stdout.strip()
+      return f'{branch}@{commit}'
+    except Exception:
+      pass
+  try:
+    out = subprocess.run(netlab_cmd(args) + ['version'], capture_output=True, text=True,
+                         stdin=subprocess.DEVNULL, timeout=60).stdout
+    m = re.search(r'netlab version (\S+)', out)
+    return m.group(1) if m else 'unknown'
+  except Exception:
+    return 'unknown'
+
+
+def run_step(cmd: typing.Union[str, typing.List[str]], cwd: str, logfile: str,
+             env: typing.Optional[dict] = None, interruptible: bool = True) -> int:
+  """
+  Run a step in its own session so a terminal Ctrl-C only reaches this script.
+  The script then decides what to interrupt (setup steps) and what to let finish (cleanup)
+  """
+  argv = cmd.split(' ') if isinstance(cmd, str) else cmd
+  with open(logfile, 'w') as logf:
+    logf.write(f"# {' '.join(argv)}\n")
+    logf.flush()
+    # stdin is a pipe we never write to and keep open until the step ends: it isn't our terminal
+    # (so no child can switch it to raw mode), but unlike /dev/null it never hits EOF.
+    # netlab's ASAv SSH ready check ('exit' sent over ssh) fails with rc 255 when ssh's stdin is at EOF
+    proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.PIPE, stdout=logf, stderr=subprocess.STDOUT,
+                            env=env or os.environ.copy(), start_new_session=True)
+    with procs_lock:
+      running_procs[proc] = interruptible
+    if interruptible and stop_event.is_set():     # Interrupted while we were starting it
+      interrupt_proc(proc)
+    try:
+      return proc.wait()
+    finally:
+      if proc.stdin:
+        proc.stdin.close()
+      with procs_lock:
+        running_procs.pop(proc, None)
+
+
+def interrupt_proc(proc: subprocess.Popen) -> None:
+  try:
+    os.killpg(proc.pid, signal.SIGINT)            # Same as Ctrl-C for the whole step (netlab, ansible, containerlab)
+  except ProcessLookupError:
+    pass
+
+
+def interrupt_running_steps() -> None:
+  with procs_lock:
+    procs = [p for p, interruptible in running_procs.items() if interruptible]
+  for proc in procs:
+    interrupt_proc(proc)
+
+
+def integration_overrides(labdir: str, args: argparse.Namespace) -> dict:
+  """
+  Read defaults.netlab.integration (custom up/initial/validate/skip) from the lab snapshot.
+  Asks netlab itself, so it works whichever netlab (and Python) is used
+  """
+  try:
+    out = subprocess.run(netlab_cmd(args) + ['inspect', '--format', 'json', 'defaults.netlab.integration'],
+                         cwd=labdir, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=120).stdout
+    data = json.loads(out)
+    return dict(data) if isinstance(data, dict) else {}
+  except Exception:                               # Most tests don't define it: netlab reports an error
+    return {}
+
+
+def classify_create_failure(logfile: str) -> typing.Tuple[str, str]:
+  """
+  A topology rejected only with IncorrectValue/Attr/Type errors means the device
+  does not support a feature the test needs. Anything else is a real failure.
+  Returns (status, first error line)
+  """
+  with open(logfile) as f:
+    errors = [(m.group(1), line.strip()) for line in f if (m := ERROR_LINE.match(line))]
+  errors = [e for e in errors if e[0] != 'Warning']
+  if errors and all(cat in UNSUPPORTED_ERRORS for cat, _ in errors):
+    return 'unsupported', errors[0][1]
+  return 'fail', errors[0][1] if errors else ''
+
+
+def cli_value(key: str, value: typing.Any, source: str) -> str:
+  """Turn a settings value into a netlab -s 'key=value' argument (scalars only, no '=' in values)"""
+  if isinstance(value, bool):
+    value = 'true' if value else 'false'
+  elif isinstance(value, (int, float, str)):
+    value = str(value)
+  else:
+    sys.exit(f'{source}: {key} must be a string, number or true/false (netlab -s cannot set lists or dictionaries)')
+  if '=' in key or '=' in value:
+    sys.exit(f"{source}: {key}: netlab -s splits on every '=', so neither the key nor the value may contain one")
+  return f'{key}={value}'
+
+
+def load_settings(args: argparse.Namespace) -> None:
+  """
+  Read settings files into args.extra_plugins and args.all_settings (list of 'key=value').
+  Order: default settings (local.yml, when present), --settings files, then CLI -s values.
+  The last 'netlab:' key found is kept in args.settings_netlab as (path, file name)
+  """
+  args.settings_netlab = None
+  defaults = [] if args.no_default_settings else [f for f in DEFAULT_SETTINGS if os.path.exists(f)]
+  files = []
+  for fname in defaults + args.settings_files:     # Each file once, even if also given with --settings
+    if os.path.realpath(fname) not in [os.path.realpath(f) for f in files]:
+      files.append(fname)
+  args.settings_files = files
+  args.extra_plugins, args.all_settings, args.settings_data, args.settings_sources = [], [], [], []
+  for fname in args.settings_files:
+    try:
+      with open(fname) as f:
+        data = yaml.safe_load(f) or {}
+    except (OSError, yaml.YAMLError) as ex:
+      sys.exit(f'Cannot read settings file {fname}: {ex}')
+    if not isinstance(data, dict) or set(data) - {'plugin', 'set', 'netlab'}:
+      sys.exit(f"{fname}: expected a dictionary with 'netlab', 'plugin' and/or 'set' keys")
+    if 'netlab' in data:
+      if not isinstance(data['netlab'], str) or not data['netlab']:
+        sys.exit(f'{fname}: netlab must be the path of a netlab git clone or executable')
+      path = os.path.expanduser(data['netlab'])     # Relative paths are relative to the settings file
+      path = path if os.path.isabs(path) else os.path.join(os.path.dirname(os.path.abspath(fname)), path)
+      args.settings_netlab = (path, os.path.basename(fname))
+    plugins = data.get('plugin', [])
+    plugins = [plugins] if isinstance(plugins, str) else plugins
+    if not isinstance(plugins, list) or not all(isinstance(p, str) for p in plugins):
+      sys.exit(f'{fname}: plugin must be a plugin name or a list of plugin names')
+    values = data.get('set', {}) or {}
+    if not isinstance(values, dict):
+      sys.exit(f'{fname}: set must be a dictionary of dotted keys and values')
+    args.extra_plugins += [p for p in plugins if p not in args.extra_plugins]
+    args.all_settings += [cli_value(str(k), v, fname) for k, v in values.items()]
+    args.settings_sources += [os.path.basename(fname)] * len(values)
+    args.settings_data.append({'file': os.path.abspath(fname), 'netlab': data.get('netlab'),
+                               'plugin': plugins, 'set': values})
+  for s in args.settings:
+    if s.count('=') != 1:
+      sys.exit(f"-s {s}: expected exactly one '=' (netlab -s splits on every '=')")
+  args.all_settings += args.settings
+  args.settings_sources += ['-s'] * len(args.settings)
+
+
+def effective_image(args: argparse.Namespace) -> typing.Tuple[str, str]:
+  """
+  Image the device under test really runs, and where it comes from. Same precedence as netlab
+  create: -i (passed last), then the last provider-specific, then the last generic device image
+  in the settings, then the netlab default
+  """
+  if args.image:
+    return args.image, '-i'
+  for key in (f'defaults.devices.{args.device}.{args.provider}.image', f'defaults.devices.{args.device}.image'):
+    for s, src in reversed(list(zip(args.all_settings, args.settings_sources))):
+      k, v = s.split('=', 1)
+      if k == key:
+        return v, src
+  for key in (f'devices.{args.device}.{args.provider}.image', f'devices.{args.device}.image'):
+    try:                                          # Ask netlab (cwd / so no local topology-defaults.yml is read)
+      out = subprocess.run(netlab_cmd(args) + ['show', 'defaults', '--format', 'yaml', key], cwd='/',
+                           capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=60).stdout
+      value = yaml.safe_load(out)
+      if isinstance(value, str) and value:
+        return value, 'netlab default'
+    except Exception:
+      pass
+  return 'unknown', 'netlab default'
+
+
+def has_dotted(data: typing.Any, key: str) -> bool:
+  """Does the topology data contain a (possibly dotted or partially dotted) key?"""
+  if not isinstance(data, dict):
+    return False
+  if key in data:
+    return True
+  parts = key.split('.')
+  for i in range(1, len(parts)):
+    head, rest = '.'.join(parts[:i]), '.'.join(parts[i:])
+    if head in data and has_dotted(data[head], rest):
+      return True
+  return False
+
+
+def settings_for_test(test: str, settings: typing.List[str]) -> typing.Tuple[typing.List[str], typing.List[str]]:
+  """
+  * Expand wildcards in node names (nodes.dut*.x -> every node matching dut*)
+  * Drop nodes.X settings for tests without node X (netlab would add a new node X to the lab)
+  * Note settings that replace a value the test defines itself
+  """
+  try:
+    with open(test) as f:
+      topo = yaml.safe_load(f) or {}
+  except Exception:
+    return settings, []
+  nodes = topo.get('nodes', {}) or {}
+  node_names = sorted(nodes) if isinstance(nodes, dict) else [n for n in nodes if isinstance(n, str)]
+  kept, notes = [], []
+  for s in settings:
+    key, value = s.split('=', 1)
+    if not key.startswith('nodes.'):
+      kept.append(s)
+      continue
+    pattern, rest = key.split('.', 2)[1], key.split('.', 2)[2:]
+    matches = fnmatch.filter(node_names, pattern)
+    if not matches:
+      notes.append(f'setting {key} skipped: no node matching {pattern} in the test')
+      continue
+    for node in matches:
+      n_key = '.'.join(['nodes', node] + rest)
+      if has_dotted(topo, n_key):
+        notes.append(f'setting {n_key} replaces the value defined in the test')
+      kept.append(f'{n_key}={value}')
+  return kept, notes
+
+
+def archive_unsupported(name: str, lab_id: int, logdir: str, args: argparse.Namespace) -> None:
+  """Append an unsupported test's create.log to the run's unsupported.log, then remove its log folder"""
+  try:
+    with open(os.path.join(logdir, 'create.log')) as f:
+      content = f.read()
+  except OSError:
+    return                                        # Nothing to archive: keep the folder as it is
+  with unsupported_lock:
+    with open(os.path.join(args.run_logdir, 'unsupported.log'), 'a') as f:
+      f.write(f'===== {name} (lab {lab_id}) =====\n{content.rstrip()}\n\n')
+  shutil.rmtree(logdir, ignore_errors=True)
+
+
+def cleanup(labdir: str, logdir: str, args: argparse.Namespace) -> bool:
+  cmd = netlab_cmd(args) + ['down', '--cleanup', '--force', '--force']
+  return run_step(cmd, labdir, os.path.join(logdir, 'down.log'), interruptible=False) == 0
+
+
+def run_test(test: str, args: argparse.Namespace, pool: 'queue.Queue[int]') -> dict:
+  suite = os.path.basename(os.path.dirname(test))
+  name = f'{suite}/{os.path.basename(test)}'
+  short = f"{suite}-{os.path.basename(test).removesuffix('.yml')}"
+  result: dict = {'test': name, '_timestamp': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}
+  if stop_event.is_set():
+    result['status'] = 'aborted'
+    return result
+
+  lab_id = pool.get()
+  labdir = os.path.join(args.run_workdir, short)
+  logdir = os.path.join(args.run_logdir, short)
+  os.makedirs(labdir, exist_ok=True)
+  os.makedirs(logdir, exist_ok=True)
+  result.update(id=lab_id, logs=logdir, path=test)
+  steps = args.steps.split(',')
+  release_id = True
+  lab_started = False
+  t_start = time.time()
+
+  def step_log(step: str) -> str:
+    return os.path.join(logdir, f'{step}.log')
+
+  def finish(status: str, failed_step: str = '') -> dict:
+    nonlocal release_id
+    if status == 'fail' and stop_event.is_set():  # The step most probably failed because we interrupted it
+      status = 'aborted'
+    result['status'] = status
+    if failed_step:
+      result['failed_step'] = failed_step
+    keep_lab = lab_started and status == 'fail' and args.keep_failed
+    if lab_started and not keep_lab:
+      result['cleanup'] = cleanup(labdir, logdir, args)
+      if not result['cleanup']:
+        release_id = False                      # Don't hand out an ID whose lab might still be up
+    if keep_lab:
+      release_id = False
+      result['labdir'] = labdir
+      log(f'[{lab_id}] {name}: lab left running in {labdir}')
+    elif result.get('cleanup', True):
+      shutil.rmtree(labdir, ignore_errors=True) # Generated lab files are useless once the lab is gone
+    else:
+      result['labdir'] = labdir
+    with active_lock:
+      active_dirs.pop(labdir, None)
+    if status == 'unsupported':                   # Only a create.log: keep it in unsupported.log, drop the folder
+      archive_unsupported(name, lab_id, logdir, args)
+      result.pop('logs', None)
+    if release_id:
+      pool.put(lab_id)
+    result['duration'] = round(time.time() - t_start)
+    return result
+
+  log(f'[{lab_id}] {name}: start (logs: {logdir})')
+
+  create = netlab_cmd(args) + ['create', '-d', args.device, '-p', args.provider,
+                               '--plugin', 'multilab', '-s', f'defaults.multilab.id={lab_id}']
+  if args.lock_file:
+    create += ['-s', f'defaults.multilab.lock={args.lock_file}']
+  if not args.shared_status_file:                 # Own status file: no lock contention with the other labs
+    create += ['-s', f'defaults.lab_status_file={os.path.join(labdir, LAB_STATUS_FILE)}']
+  for p in args.extra_plugins:
+    create += ['--plugin', p]
+  settings, notes = settings_for_test(test, args.all_settings)
+  for s in settings:
+    create += ['-s', s]
+  for note in notes:
+    log(f'[{lab_id}] {name}: {note}')
+  if notes:
+    result['settings_notes'] = notes
+  if args.image:                                  # Last, so it wins over settings files (e.g. local.yml) and -s
+    create += ['-s', f'defaults.devices.{args.device}.{args.provider}.image={args.image}']
+  create.append(test)
+
+  if run_step(create, labdir, step_log('create')) != 0:
+    result['create'] = False
+    status, reason = classify_create_failure(step_log('create'))
+    if reason:
+      result['reason'] = reason
+    log(f"[{lab_id}] {name}: create {'unsupported' if status == 'unsupported' else failed()}: {reason}")
+    return finish(status, 'create')
+  result['create'] = True
+
+  overrides = integration_overrides(labdir, args)
+  skip = overrides.get('skip', [])
+  skip = [skip] if isinstance(skip, str) else list(skip)
+  executed = []
+
+  if 'up' in steps and 'up' not in skip and not stop_event.is_set():
+    with active_lock:
+      active_dirs[labdir] = (lab_id, logdir)
+    lab_started = True
+    up_cmd = overrides.get('up', ' '.join(netlab_cmd(args) + ['up', '--snapshot', '--no-config']))
+    if run_step(up_cmd, labdir, step_log('up')) != 0:
+      result['up'] = False
+      log(f'[{lab_id}] {name}: up {failed()}')
+      return finish('fail', 'up')
+    result['up'] = True
+    executed.append('up')
+
+  if 'initial' in steps and 'initial' not in skip and not stop_event.is_set():
+    env = os.environ.copy()
+    env['ANSIBLE_ANY_ERRORS_FATAL'] = 'True'
+    default_initial = netlab_cmd(args) + (['initial'] if 'up' in executed else ['initial', '-o', 'config'])
+    if run_step(overrides.get('initial', ' '.join(default_initial)), labdir, step_log('initial'), env) != 0:
+      result['config'] = False
+      log(f'[{lab_id}] {name}: config {failed()}')
+      return finish('fail', 'config')
+    result['config'] = True
+    executed.append('initial')
+
+  if stop_event.is_set():
+    return finish('aborted')
+
+  if 'validate' not in steps or 'validate' in skip:
+    return finish('ok')
+  if ('up' not in executed or 'initial' not in executed) and 'validate' not in overrides:
+    result['validate'] = 'unavailable'
+    return finish('ok')
+
+  valid_cmd = netlab_cmd(args) + ['validate', '--skip-missing'] + ([] if args.verbose else ['--error-only'])
+  rc = run_step(overrides.get('validate', ' '.join(valid_cmd)), labdir, step_log('validate'))
+  log_status = {0: True, 2: 'skipped', 3: 'warning'}.get(rc, False)
+  result['validate'] = log_status
+  log(f"[{lab_id}] {name}: validate {failed() if log_status is False else log_status}")
+  if rc in (0, 2):
+    return finish('ok')
+  if rc == 3:
+    return finish('warning')
+  return finish('fail', 'validate')
+
+
+def sigterm_handler(signum: int, frame: typing.Any) -> None:
+  raise KeyboardInterrupt
+
+
+def save_terminal() -> typing.Optional[list]:
+  try:
+    return termios.tcgetattr(sys.stdin.fileno()) if sys.stdin.isatty() else None
+  except termios.error:
+    return None
+
+
+def restore_terminal(saved: typing.Optional[list]) -> None:
+  """Undo any terminal mode change (e.g. raw mode that disables Ctrl-C) left by a child process"""
+  if saved is None:
+    return
+  try:
+    termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, saved)
+  except termios.error:
+    pass
+
+
+def sudo_keepalive() -> None:
+  while not stop_event.wait(60):
+    subprocess.run(['sudo', '-n', 'true'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def write_reports(results: typing.List[dict], args: argparse.Namespace, info: dict) -> str:
+  results = sorted(results, key=lambda r: r['test'])
+  with open(os.path.join(args.run_logdir, 'results.yaml'), 'w') as f:
+    yaml.safe_dump(results, f, sort_keys=False)
+
+  header = (f"Run {info['run']}  device={info['device']}  image={info['image']} (from {args.image_source})"
+            f"  netlab={info['netlab']}" + (f"  settings={info['settings']}" if info['settings'] else ''))
+  tested = [r for r in results if r['status'] != 'unsupported']
+  unsupported = [r for r in results if r['status'] == 'unsupported']
+
+  # summary.txt: only the tests that ran, so the interesting results aren't lost among unsupported ones
+  # Sorted by status (same order as history.tsv), then test: what needs work is grouped at the top
+  rank = {s: i for i, s in enumerate(HISTORY_ORDER)}
+  lines = [header, '', f"{'test':<40} {'id':>4} {'status':<11} {'time':>6}  steps"]
+  for r in sorted(tested, key=lambda r: (rank.get(r['status'], len(rank)), r['test'])):
+    steps = ' '.join(f'{k}={r[k]}' for k in ('create', 'up', 'config', 'validate', 'cleanup') if k in r)
+    lines.append(f"{r['test']:<40} {r.get('id', '-'):>4} {r['status']:<11} {r.get('duration', 0):>5}s  {steps}")
+  if not tested:
+    lines.append('(no test ran: all were unsupported)')
+  counts = {s: sum(1 for r in results if r['status'] == s) for s in STATUSES}
+  lines += ['', '  '.join(f'{k}: {v}' for k, v in counts.items() if v)]
+  failed = [r for r in tested if r['status'] == 'fail' and r.get('failed_step')]
+  if failed:
+    step_log = {'config': 'initial'}               # config step is logged in initial.log
+    lines += ['', 'Failed (log to read):']
+    lines += [f"  {r['test']:<38} {r['failed_step']:<9} {os.path.join(r['logs'], step_log.get(r['failed_step'], r['failed_step']) + '.log')}"
+              for r in failed]
+  if unsupported:
+    lines += ['', f"{len(unsupported)} unsupported test(s), see {os.path.join(args.run_logdir, 'unsupported.txt')}"]
+  summary = '\n'.join(lines)
+  with open(os.path.join(args.run_logdir, 'summary.txt'), 'w') as f:
+    f.write(summary + '\n')
+
+  # unsupported.txt: what the device can't do, grouped by reason
+  if unsupported:
+    u_lines = [header, '', f'{len(unsupported)} test(s) netlab cannot build for {info["device"]} '
+               f'(full create.log of each: unsupported.log):', '']
+    for r in sorted(unsupported, key=lambda r: (r.get('reason', ''), r['test'])):
+      u_lines.append(f"{r['test']:<40} {r.get('reason', '')}")
+    with open(os.path.join(args.run_logdir, 'unsupported.txt'), 'w') as f:
+      f.write('\n'.join(u_lines) + '\n')
+
+  history = os.path.join(args.logdir, 'history.tsv')
+  header = '\t'.join(HISTORY_FIELDS) + '\n'
+  if os.path.exists(history):
+    with open(history) as f:
+      lines_h = f.readlines()
+    if lines_h and lines_h[0] != header:            # Older file without newer columns: old rows just leave them empty
+      lines_h[0] = header
+      with open(history, 'w') as f:
+        f.writelines(lines_h)
+  new_file = not os.path.exists(history)
+  with open(history, 'a') as f:
+    if new_file:
+      f.write(header)
+    # File stays chronological; within a run: status, then test
+    for r in sorted(results, key=lambda r: (rank.get(r['status'], len(rank)), r['test'])):
+      row = dict(info, test=r['test'], status=r['status'], failed_step=r.get('failed_step', ''),
+                 duration=r.get('duration', ''), logs=os.path.relpath(r['logs'], args.logdir) if 'logs' in r else '',
+                 date=r['_timestamp'], reason=r.get('reason', '').replace('\t', ' '))
+      f.write('\t'.join(str(row.get(k, '')) for k in HISTORY_FIELDS) + '\n')
+
+  latest = os.path.join(args.logdir, 'latest')
+  if os.path.islink(latest):
+    os.unlink(latest)
+  if not os.path.exists(latest):
+    os.symlink(info['run'], latest)
+  return summary
+
+
+def leftover_step_pids(labdir: str) -> typing.List[int]:
+  """Processes (orphaned netlab/ansible steps) whose working directory is inside labdir"""
+  pids = []
+  for entry in os.listdir('/proc'):
+    if not entry.isdigit() or int(entry) == os.getpid():
+      continue
+    try:
+      cwd = os.readlink(f'/proc/{entry}/cwd')
+    except OSError:
+      continue
+    if cwd == labdir or cwd.startswith(labdir + '/'):
+      pids.append(int(entry))
+  return pids
+
+
+def other_runs() -> typing.List[typing.Tuple[int, str]]:
+  """Other live parallel-test processes (running tests, not --cleanup)"""
+  runs = []
+  for entry in os.listdir('/proc'):
+    if not entry.isdigit() or int(entry) == os.getpid():
+      continue
+    try:
+      with open(f'/proc/{entry}/cmdline', 'rb') as f:
+        argv = f.read().decode(errors='replace').split('\0')
+    except OSError:
+      continue
+    if any(os.path.basename(a) == 'parallel-test' for a in argv[:2]) and '--cleanup' not in argv:
+      runs.append((int(entry), ' '.join(argv).strip()))
+  return runs
+
+
+def cleanup_leftovers(args: argparse.Namespace) -> int:
+  """
+  Tear down labs whose directory is under --workdir: labs with running containers (found through
+  docker, whatever any status file says) and labs still registered in the shared netlab status file.
+  Used when labs were left behind (kill -9, crash, failed teardown)
+  """
+  root = os.path.abspath(args.workdir) + '/'
+  others = other_runs()
+  if others:                                      # Their labs are under the same workdir and very much alive
+    print('Another parallel-test run is active, not cleaning up (it would tear down its labs too):')
+    for pid, cmdline in others:
+      print(f'  pid {pid}: {cmdline[:120]}')
+    print("Wait for it to finish")
+    return 1
+  labs: typing.Dict[typing.Any, str] = {}        # lab ID -> lab directory
+  for lab_id, labdir in running_ml_labs().items():
+    if (labdir + '/').startswith(root):
+      labs[lab_id] = labdir
+  try:
+    with open(STATUS_FILE) as f:
+      status = yaml.safe_load(f) or {}
+    for k, v in status.items():
+      if str(v.get('dir', '')).startswith(root):
+        labs.setdefault(int(k) if str(k).isdigit() else k, v['dir'])
+  except Exception:
+    pass
+  if not labs:
+    print(f'No running labs under {root}')
+    return 0
+
+  print(f"Tearing down {len(labs)} lab(s) under {root}: IDs {' '.join(str(k) for k in labs)}")
+  for labdir in labs.values():                    # First stop leftover steps so they don't fight the teardown
+    for pid in leftover_step_pids(labdir):
+      try:
+        os.killpg(os.getpgid(pid), signal.SIGINT)
+      except (ProcessLookupError, PermissionError):
+        pass
+  deadline = time.time() + 20
+  while time.time() < deadline and any(leftover_step_pids(d) for d in labs.values()):
+    time.sleep(1)
+  for labdir in labs.values():
+    for pid in leftover_step_pids(labdir):
+      print(f'  killing leftover process {pid} in {labdir}')
+      try:
+        os.kill(pid, signal.SIGKILL)
+      except ProcessLookupError:
+        pass
+
+  failed = 0
+  for lab_id, labdir in labs.items():
+    run, short = labdir[len(root):].split('/', 1) if '/' in labdir[len(root):] else ('', '')
+    logdir = os.path.join(os.path.abspath(args.logdir), run, short)
+    if not os.path.isdir(logdir):                 # Test log folder unknown: keep the teardown log anyway
+      logdir = os.path.join(os.path.abspath(args.logdir), 'cleanup', run or 'unknown', short or f'ml-{lab_id}')
+      os.makedirs(logdir, exist_ok=True)
+    if os.path.isfile(os.path.join(labdir, 'netlab.snapshot.pickle')):
+      ok = cleanup(labdir, logdir, args)          # netlab down also removes what netlab created (bridges...)
+      down_log = os.path.join(logdir, 'down.log')
+    else:                                         # Lab files gone: let containerlab remove the containers
+      down_log = os.path.join(logdir, 'containerlab-destroy.log')
+      ok = run_step(['containerlab', 'destroy', '--cleanup', '--name', f'ml-{lab_id}'], logdir,
+                    down_log, interruptible=False) == 0
+    print(f"  [{lab_id}] {labdir}: cleanup {'ok' if ok else 'FAILED'}  (log: {down_log})")
+    if ok:
+      shutil.rmtree(labdir, ignore_errors=True)
+    else:
+      failed += 1
+  return 1 if failed else 0
+
+
+def main() -> None:
+  global run_log
+  args = parse_args()
+  load_settings(args)                              # First: local.yml may say which netlab to use
+  resolve_netlab(args)
+  if args.cleanup:
+    sys.exit(cleanup_leftovers(args))
+  if not (args.tests or args.all or args.from_run):
+    sys.exit('Specify tests (files or directories), --all or --from-run, or use --cleanup')
+  if not args.device:                              # -d wins; otherwise the last defaults.device in the settings
+    for s in reversed(args.all_settings):
+      k, v = s.split('=', 1)
+      if k == 'defaults.device':
+        args.device = v
+        break
+  if not args.device:
+    sys.exit('Specify the device with -d or with defaults.device in a --settings file')
+  args.lock_file = None if args.no_lock else os.path.abspath(os.path.expanduser(args.lock))
+  if args.lock_file:
+    os.makedirs(os.path.dirname(args.lock_file), exist_ok=True)
+
+  tests = collect_tests(args.tests + (all_test_dirs(args) if args.all else []), args.limit)
+  if args.from_run:
+    tests += tests_from_run(args)
+  tests = list(dict.fromkeys(tests))               # Same test given twice (e.g. a file and its directory): run once
+  if not tests:
+    sys.exit('No tests to run')
+
+  pool = build_id_pool(args, min(args.jobs, len(tests)))
+  jobs = pool.qsize()
+  run_name = args.name or f"{args.device}-{time.strftime('%Y%m%d-%H%M%S')}"
+  args.run_logdir = os.path.abspath(os.path.join(args.logdir, run_name))
+  args.run_workdir = os.path.abspath(os.path.join(args.workdir, run_name))
+  args.logdir = os.path.abspath(args.logdir)
+  if os.path.exists(args.run_logdir):
+    sys.exit(f'Run directory {args.run_logdir} already exists, use another --name')
+  os.makedirs(args.run_logdir)
+  os.makedirs(args.run_workdir, exist_ok=True)
+  shim_dir = add_netlab_to_path(args)
+
+  image, image_source = effective_image(args)
+  info = {'run': run_name, 'device': args.device, 'provider': args.provider,
+          'image': image, 'netlab': netlab_version(args),
+          'settings': ','.join(os.path.basename(f) for f in args.settings_files)}
+  args.image_source = image_source
+  for fname in args.settings_files:                # Keep a copy: the file may change before the next run
+    shutil.copy(fname, os.path.join(args.run_logdir, f'settings-{os.path.basename(fname)}'))
+  with open(os.path.join(args.run_logdir, 'run-info.yaml'), 'w') as f:
+    yaml.safe_dump(dict(info, image_source=image_source,
+                        netlab_path=args.netlab_exe, netlab_source=args.netlab_source,
+                        command=shlex.join(sys.argv), tests=tests, jobs=jobs, lock=args.lock_file,
+                        settings=args.settings_data, extra_plugins=args.extra_plugins,
+                        netlab_settings=args.all_settings,
+                        started=time.strftime('%Y-%m-%d %H:%M:%S')), f, sort_keys=False)
+  run_log = open(os.path.join(args.run_logdir, 'run.log'), 'w')
+
+  log(f'Running {len(tests)} test(s), {jobs} at a time, multilab IDs {sorted(pool.queue)}')
+  log(f'Logs: {args.run_logdir}')
+  log(f"Provider lock: {args.lock_file or 'disabled'}")
+  log(f"netlab: {args.netlab_exe} ({info['netlab']}, from {args.netlab_source})")
+  log(f'Image: {image} (from {image_source})')
+  if args.settings_files or args.settings:
+    log(f"Settings: {', '.join(args.settings_files) or 'CLI only'}; plugins {args.extra_plugins or 'none'}; "
+        f"{len(args.all_settings)} value(s)")
+  if args.sudo:
+    subprocess.run(['sudo', 'true'], check=True)     # Prime sudo so parallel workers don't race for a password prompt
+    threading.Thread(target=sudo_keepalive, daemon=True).start()
+
+  saved_tty = save_terminal()
+  signal.signal(signal.SIGINT, signal.default_int_handler)  # Python skips this if SIGINT was ignored at startup (e.g. started with &)
+  signal.signal(signal.SIGTERM, sigterm_handler)    # 'kill <pid>' from another terminal behaves like Ctrl-C
+  signal.signal(signal.SIGHUP, sigterm_handler)     # So does closing the terminal/tmux pane (steps run in their own sessions and would be orphaned)
+  results: typing.List[dict] = []
+  executor = ThreadPoolExecutor(max_workers=jobs)
+  futures = [executor.submit(run_test, t, args, pool) for t in tests]
+  try:
+    for f in futures:
+      results.append(f.result())
+  except KeyboardInterrupt:
+    stop_event.set()
+    log('Interrupted: stopping running steps and tearing down started labs (Ctrl-C again to quit without cleanup)')
+    for f in futures:
+      f.cancel()                                  # Tests that haven't started yet
+    interrupt_running_steps()
+    try:
+      results = []
+      for test, f in zip(tests, futures):
+        if f.cancelled():
+          results.append({'test': f'{os.path.basename(os.path.dirname(test))}/{os.path.basename(test)}',
+                          '_timestamp': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
+                          'status': 'aborted', 'reason': 'not started'})
+          continue
+        try:
+          results.append(f.result())              # Workers tear down their own labs, then return
+        except KeyboardInterrupt:
+          raise
+        except Exception as ex:
+          log(f'Worker error: {ex}')
+    except KeyboardInterrupt:
+      with active_lock:
+        dirs = dict(active_dirs)
+      log('Second interrupt: exiting without waiting for cleanup (teardowns already started keep running in the background)')
+      for labdir, (lab_id, _) in dirs.items():
+        log(f'  [{lab_id}] might still be running: {labdir}')
+      log("Remove leftover labs with './parallel-test --cleanup' once the teardowns are over")
+      restore_terminal(saved_tty)
+      os._exit(130)
+  finally:
+    stop_event.set()
+    executor.shutdown(wait=False)
+
+  restore_terminal(saved_tty)
+  summary = write_reports(results, args, info)
+  with print_lock:
+    print('\n' + summary)
+    print(f'\nDetails: {args.run_logdir}/<test>/{{create,up,initial,validate,down}}.log')
+    print(f"History: {os.path.join(args.logdir, 'history.tsv')}")
+  run_log.write('\n' + summary + '\n')
+  run_log.close()
+
+  shutil.rmtree(shim_dir, ignore_errors=True)
+  if not os.listdir(args.run_workdir):
+    os.rmdir(args.run_workdir)
+  if any(r['status'] in ('fail', 'aborted') for r in results):
+    sys.exit(1)
+
+
+if __name__ == '__main__':
+  main()
